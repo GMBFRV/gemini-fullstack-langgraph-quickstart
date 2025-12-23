@@ -1,120 +1,139 @@
-# Gemini Fullstack LangGraph Quickstart
+# Groq Fullstack LangGraph Research Agent
 
-This project demonstrates a fullstack application using a React frontend and a LangGraph-powered backend agent. The agent is designed to perform comprehensive research on a user's query by dynamically generating search terms, querying the web using Google Search, reflecting on the results to identify knowledge gaps, and iteratively refining its search until it can provide a well-supported answer with citations. This application serves as an example of building research-augmented conversational AI using LangGraph and Google's Gemini models.
+This project demonstrates a fullstack research application using a React frontend and a LangGraph-powered backend agent.
 
-<img src="./app.png" title="Gemini Fullstack LangGraph" alt="Gemini Fullstack LangGraph" width="90%">
+The backend agent performs iterative, tool-augmented web research: it dynamically generates search queries, gathers information from the web using free, keyless search tools, reflects on the gathered information to detect knowledge gaps, and refines its search until it can produce a grounded answer with explicit citations.
+
+The project is designed as a universal research agent, not tailored to any specific topic or query, and serves as a reference architecture for research-augmented conversational AI using LangGraph and open LLMs.
 
 ## Features
 
-- 💬 Fullstack application with a React frontend and LangGraph backend.
-- 🧠 Powered by a LangGraph agent for advanced research and conversational AI.
-- 🔍 Dynamic search query generation using Google Gemini models.
-- 🌐 Integrated web research via Google Search API.
-- 🤔 Reflective reasoning to identify knowledge gaps and refine searches.
-- 📄 Generates answers with citations from gathered sources.
-- 🔄 Hot-reloading for both frontend and backend during development.
+- Fullstack application with a React frontend and LangGraph backend
+- Multi-step LangGraph research agent (query → search → reflection → refinement → answer)
+- Dynamic query generation using Groq LLM (llama-3.3-70b-versatile)
+- Web research via free, no-API-key metasearch
+- Reflective reasoning to identify knowledge gaps
+- Final answers grounded in retrieved sources with explicit citations
+- CLI interface for fast local testing
+- Hot-reloading during development
 
 ## Project Structure
 
-The project is divided into two main directories:
+frontend/
+  React application (Vite)
 
--   `frontend/`: Contains the React application built with Vite.
--   `backend/`: Contains the LangGraph/FastAPI application, including the research agent logic.
+backend/
+  src/
+    agent/
+      graph.py
+      state.py
+      prompts.py
+      utils.py
+      tools_and_schemas.py
+      configuration.py
+  examples/
+    cli_research.py
+  app.py
+  .env
+  pyproject.toml
 
-## Getting Started: Development and Local Testing
+The backend uses a src-layout. Make sure backend/src is on PYTHONPATH or use an editable install.
 
-Follow these steps to get the application running locally for development and testing.
+## Getting Started
 
-**1. Prerequisites:**
+Prerequisites:
+- Node.js 18+
+- Python 3.11+
+- Groq API key
 
--   Node.js and npm (or yarn/pnpm)
--   Python 3.11+
--   **`GEMINI_API_KEY`**: The backend agent requires a Google Gemini API key.
-    1.  Navigate to the `backend/` directory.
-    2.  Create a file named `.env` by copying the `backend/.env.example` file.
-    3.  Open the `.env` file and add your Gemini API key: `GEMINI_API_KEY="YOUR_ACTUAL_API_KEY"`
+Environment setup (from backend directory):
 
-**2. Install Dependencies:**
+cp .env.example .env
 
-**Backend:**
+Edit .env:
 
-```bash
+GROQ_API_KEY=your_actual_groq_api_key
+
+Web search does not require any API keys.
+
+## Install Dependencies
+
+Backend:
+
 cd backend
-pip install .
-```
+pip install -e .
 
-**Frontend:**
+Frontend:
 
-```bash
 cd frontend
 npm install
-```
 
-**3. Run Development Servers:**
+## Run Development Servers
 
-**Backend & Frontend:**
-
-```bash
 make dev
-```
-This will run the backend and frontend development servers.    Open your browser and navigate to the frontend development server URL (e.g., `http://localhost:5173/app`).
 
-_Alternatively, you can run the backend and frontend development servers separately. For the backend, open a terminal in the `backend/` directory and run `langgraph dev`. The backend API will be available at `http://127.0.0.1:2024`. It will also open a browser window to the LangGraph UI. For the frontend, open a terminal in the `frontend/` directory and run `npm run dev`. The frontend will be available at `http://localhost:5173`._
+Frontend: http://localhost:5173/app
+Backend: http://localhost:2024
 
-## How the Backend Agent Works (High-Level)
+Alternatively:
 
-The core of the backend is a LangGraph agent defined in `backend/src/agent/graph.py`. It follows these steps:
+cd backend
+langgraph dev
 
-<img src="./agent.png" title="Agent Flow" alt="Agent Flow" width="50%">
+cd frontend
+npm run dev
 
-1.  **Generate Initial Queries:** Based on your input, it generates a set of initial search queries using a Gemini model.
-2.  **Web Research:** For each query, it uses the Gemini model with the Google Search API to find relevant web pages.
-3.  **Reflection & Knowledge Gap Analysis:** The agent analyzes the search results to determine if the information is sufficient or if there are knowledge gaps. It uses a Gemini model for this reflection process.
-4.  **Iterative Refinement:** If gaps are found or the information is insufficient, it generates follow-up queries and repeats the web research and reflection steps (up to a configured maximum number of loops).
-5.  **Finalize Answer:** Once the research is deemed sufficient, the agent synthesizes the gathered information into a coherent answer, including citations from the web sources, using a Gemini model.
+## How the Backend Agent Works
 
-## CLI Example
+The LangGraph agent defined in backend/src/agent/graph.py follows a universal research loop:
 
-For quick one-off questions you can execute the agent from the command line. The
-script `backend/examples/cli_research.py` runs the LangGraph agent and prints the
-final answer:
+1. Generate search queries from the user question
+2. Perform web research using free, keyless search tools
+3. Produce grounded summaries with explicit source references
+4. Reflect on results and detect knowledge gaps
+5. Iteratively refine search queries if needed
+6. Synthesize a final answer strictly grounded in collected sources
 
-```bash
+The agent is topic-agnostic and works for arbitrary research questions.
+
+## CLI Usage
+
 cd backend
 python examples/cli_research.py "What are the latest trends in renewable energy?"
-```
 
+The CLI runs the full research loop and prints the final grounded answer.
 
-## Deployment
+## Deployment Notes
 
-In production, the backend server serves the optimized static frontend build. LangGraph requires a Redis instance and a Postgres database. Redis is used as a pub-sub broker to enable streaming real time output from background runs. Postgres is used to store assistants, threads, runs, persist thread state and long term memory, and to manage the state of the background task queue with 'exactly once' semantics. For more details on how to deploy the backend server, take a look at the [LangGraph Documentation](https://langchain-ai.github.io/langgraph/concepts/deployment_options/). Below is an example of how to build a Docker image that includes the optimized frontend build and the backend server and run it via `docker-compose`.
+In production, the backend can serve the optimized frontend build.
 
-_Note: For the docker-compose.yml example you need a LangSmith API key, you can get one from [LangSmith](https://smith.langchain.com/settings)._
+LangGraph supports production deployments backed by PostgreSQL for persistence and Redis for streaming and background execution.
 
-_Note: If you are not running the docker-compose.yml example or exposing the backend server to the public internet, you should update the `apiUrl` in the `frontend/src/App.tsx` file to your host. Currently the `apiUrl` is set to `http://localhost:8123` for docker-compose or `http://localhost:2024` for development._
+Production infrastructure is optional. The project works fully in local and CLI mode without Redis or Postgres.
 
-**1. Build the Docker Image:**
-
-   Run the following command from the **project root directory**:
-   ```bash
-   docker build -t gemini-fullstack-langgraph -f Dockerfile .
-   ```
-**2. Run the Production Server:**
-
-   ```bash
-   GEMINI_API_KEY=<your_gemini_api_key> LANGSMITH_API_KEY=<your_langsmith_api_key> docker-compose up
-   ```
-
-Open your browser and navigate to `http://localhost:8123/app/` to see the application. The API will be available at `http://localhost:8123`.
+LangGraph deployment documentation:
+https://langchain-ai.github.io/langgraph/concepts/deployment_options/
 
 ## Technologies Used
 
-- [React](https://reactjs.org/) (with [Vite](https://vitejs.dev/)) - For the frontend user interface.
-- [Tailwind CSS](https://tailwindcss.com/) - For styling.
-- [Shadcn UI](https://ui.shadcn.com/) - For components.
-- [LangGraph](https://github.com/langchain-ai/langgraph) - For building the backend research agent.
-- [Google Gemini](https://ai.google.dev/models/gemini) - LLM for query generation, reflection, and answer synthesis.
+Frontend:
+React
+Vite
+Tailwind CSS
+Shadcn UI
+
+Backend:
+Python 3.11+
+FastAPI
+LangGraph
+
+LLM:
+Groq llama-3.3-70b-versatile
+
+Web Search:
+Free no-API-key metasearch
 
 ## License
 
-This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details. 
+This project is licensed under the Apache License 2.0.
+See the LICENSE file for details.

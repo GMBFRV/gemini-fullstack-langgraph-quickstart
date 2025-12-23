@@ -1,27 +1,22 @@
 import argparse
+import sys
+from pathlib import Path
+
+SRC_PATH = Path(__file__).resolve().parents[1] / "src"
+sys.path.insert(0, str(SRC_PATH))
+
 from langchain_core.messages import HumanMessage
 from agent.graph import graph
 
 
 def main() -> None:
-    """Run the research agent from the command line."""
     parser = argparse.ArgumentParser(description="Run the LangGraph research agent")
     parser.add_argument("question", help="Research question")
-    parser.add_argument(
-        "--initial-queries",
-        type=int,
-        default=3,
-        help="Number of initial search queries",
-    )
-    parser.add_argument(
-        "--max-loops",
-        type=int,
-        default=2,
-        help="Maximum number of research loops",
-    )
+    parser.add_argument("--initial-queries", type=int, default=3)
+    parser.add_argument("--max-loops", type=int, default=2)
     parser.add_argument(
         "--reasoning-model",
-        default="gemini-2.5-pro-preview-05-06",
+        default="llama-3.3-70b-versatile",
         help="Model for the final answer",
     )
     args = parser.parse_args()
