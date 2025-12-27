@@ -1,34 +1,28 @@
 import os
-from agent.tools_and_schemas import SearchQueryList, Reflection
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage
-from langgraph.types import Send
-from langgraph.graph import StateGraph
-from langgraph.graph import START, END
-from langchain_core.runnables import RunnableConfig
 
-from agent.state import (
-    OverallState,
-    QueryGenerationState,
-    ReflectionState,
-    WebSearchState,
-)
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableConfig
+from langchain_groq import ChatGroq
+from langgraph.graph import END, START, StateGraph
+
 from agent.configuration import Configuration
 from agent.prompts import (
-    get_current_date,
-    query_writer_instructions,
-    web_searcher_instructions,
-    reflection_instructions,
     answer_instructions,
+    get_current_date,
+    local_reader_instructions,
+    reflection_instructions,
 )
-
-from langchain_groq import ChatGroq
-
+from agent.state import OverallState
+from agent.tools_and_schemas import Reflection
 from agent.utils import (
-    get_research_topic,
-    searxng_search,
-    shorten_sources,
+    build_file_profile,
     format_search_results_for_prompt,
+    get_research_topic,
+    list_text_files,
+    pick_excerpts_for_file,
+    score_profile,
+    sources_from_excerpts,
 )
 
 load_dotenv()
@@ -36,164 +30,161 @@ load_dotenv()
 if os.getenv("GROQ_API_KEY") is None:
     raise ValueError("GROQ_API_KEY is not set")
 
-# Public SearXNG instances (no key).
-DEFAULT_SEARXNG_INSTANCES = [
-    "https://searxng.site",
-    "https://search.projectsegfau.lt",
-    "https://searx.tiekoetter.com",
-]
+
+def scan_directory(state: OverallState, config: RunnableConfig) -> dict:
+    # Phase 1: local search replacement for web search.
+    # Build cheap profiles for all files and rank them without reading full content.
+    question = get_research_topic(state["messages"])
+    directory = state["search_dir"]
+
+    files = list_text_files(directory)
+    profiles: dict[str, str] = {}
+    scores: dict[str, int] = {}
+
+    profile_chars = int(state.get("profile_chars", 2500))
+
+    for fp in files:
+        prof = build_file_profile(fp, profile_chars=profile_chars)
+        profiles[fp] = prof
+        scores[fp] = score_profile(question, [], fp, prof)
+
+    # Keep score==0 files to support broad / directory-level questions
+    ordered = sorted(files, key=lambda p: scores.get(p, 0), reverse=True)
+    ranked = ordered[: int(state.get("max_files", 30))]
+
+    return {
+        "ranked_files": ranked,
+        "file_profiles": profiles,
+        "file_scores": scores,
+        "read_files": [],
+        "read_files_count": 0,
+        "pending_queries": [],
+        "web_research_result": [],
+        "sources_gathered": [],
+        "research_loop_count": 0,
+    }
 
 
-def _get_searx_instances() -> list[str]:
-    env_val = os.getenv("SEARXNG_INSTANCES", "").strip()
-    if env_val:
-        return [x.strip() for x in env_val.split(",") if x.strip()]
-    return DEFAULT_SEARXNG_INSTANCES
+def read_next_file(state: OverallState, config: RunnableConfig) -> dict:
+    # Phase 2: iterative deep read of local files instead of remote retrieval.
+    # Selection is dynamic and can change based on reflection feedback.
+    question = get_research_topic(state["messages"])
+    ranked = state.get("ranked_files", [])
+    already = set(state.get("read_files", []))
+    pending = state.get("pending_queries", []) or []
 
+    remaining = [fp for fp in ranked if fp not in already]
+    if not remaining:
+        return {"web_research_result": ["No relevant local sources found."], "sources_gathered": []}
 
-def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
-    """Generate search queries based on the user's question."""
+    profiles = state.get("file_profiles", {}) or {}
+
+    rescored = []
+    for fp in remaining:
+        prof = profiles.get(fp, "")
+        rescored.append((score_profile(question, pending, fp, prof), fp))
+    rescored.sort(key=lambda x: x[0], reverse=True)
+
+    next_file = rescored[0][1]
+
+    out = {
+        "read_files": [next_file],
+        "read_files_count": int(state.get("read_files_count", 0)) + 1,
+    }
+
+    excerpts = pick_excerpts_for_file(
+        next_file,
+        question,
+        pending,
+        chunk_size=int(state.get("chunk_size", 1200)),
+        chunk_overlap=int(state.get("chunk_overlap", 150)),
+        top_chunks=int(state.get("top_chunks", 5)),
+    )
+
+    if not excerpts:
+        out.update(
+            {
+                "web_research_result": [f"Skipped unreadable or empty file: {next_file}"],
+                "sources_gathered": [],
+            }
+        )
+        return out
+
+    file_id = int(state.get("read_files_count", 0))
+    short_sources = sources_from_excerpts(next_file, file_id=file_id, excerpts=excerpts)
+    excerpts_block = format_search_results_for_prompt(short_sources)
+
     configurable = Configuration.from_runnable_config(config)
-
-    if state.get("initial_search_query_count") is None:
-        state["initial_search_query_count"] = configurable.number_of_initial_queries
-
-    llm = ChatGroq(
-        model=configurable.query_generator_model,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GROQ_API_KEY"),
-    )
-    structured_llm = llm.with_structured_output(SearchQueryList)
-
-    current_date = get_current_date()
-    formatted_prompt = query_writer_instructions.format(
-        current_date=current_date,
-        research_topic=get_research_topic(state["messages"]),
-        number_queries=state["initial_search_query_count"],
-    )
-
-    result = structured_llm.invoke(formatted_prompt)
-    return {"search_query": result.query}
-
-
-def continue_to_web_research(state: QueryGenerationState):
-    """Spawn a web_research node per query."""
-    return [
-        Send("web_research", {"search_query": search_query, "id": int(idx)})
-        for idx, search_query in enumerate(state["search_query"])
-    ]
-
-
-def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
-    """
-    Perform web research using SearXNG (no API key), then summarize with citations.
-    """
-    configurable = Configuration.from_runnable_config(config)
-
-    instances = _get_searx_instances()
-    results = searxng_search(
-        state["search_query"],
-        instances=instances,
-        max_results=8,
-        timeout=12.0,
-        lang="en",
-    )
-
-    # If no results, still return something (so reflection can decide to follow up)
-    short_sources = shorten_sources(results, state["id"]) if results else []
-    search_results_block = format_search_results_for_prompt(short_sources) if short_sources else "No results."
-
-    formatted_prompt = web_searcher_instructions.format(
-        current_date=get_current_date(),
-        research_topic=state["search_query"],
-        search_results=search_results_block,
-    )
-
     llm = ChatGroq(
         model=configurable.query_generator_model,
         temperature=0.2,
         max_retries=2,
         api_key=os.getenv("GROQ_API_KEY"),
     )
-    summary = llm.invoke(formatted_prompt).content
 
-    # sources_gathered should be a list of dicts (label, short_url, value, ...)
-    return {
-        "sources_gathered": short_sources,
-        "search_query": [state["search_query"]],
-        "web_research_result": [summary],
-    }
+    prompt = local_reader_instructions.format(
+        current_date=get_current_date(),
+        question=question,
+        file_path=next_file,
+        excerpts=excerpts_block,
+    )
+    summary = llm.invoke(prompt).content
+
+    out.update({"web_research_result": [summary], "sources_gathered": short_sources})
+    return out
 
 
-def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
-    """Identify knowledge gaps and generate follow-up queries."""
+def reflection(state: OverallState, config: RunnableConfig) -> dict:
+    # Reflection decides whether local coverage is sufficient
+    # and produces follow-up queries for further local search if needed.
     configurable = Configuration.from_runnable_config(config)
-
-    state["research_loop_count"] = state.get("research_loop_count", 0) + 1
     reasoning_model = state.get("reasoning_model", configurable.reflection_model)
 
-    current_date = get_current_date()
-    formatted_prompt = reflection_instructions.format(
-        current_date=current_date,
-        research_topic=get_research_topic(state["messages"]),
-        summaries="\n\n---\n\n".join(state["web_research_result"]),
-    )
+    next_count = int(state.get("research_loop_count", 0)) + 1
+    summaries = "\n\n---\n\n".join(state.get("web_research_result", []))
+    question = get_research_topic(state["messages"])
+
+    prompt = reflection_instructions.format(question=question, summaries=summaries)
 
     llm = ChatGroq(
         model=reasoning_model,
-        temperature=0.7,
+        temperature=0.4,
         max_retries=2,
         api_key=os.getenv("GROQ_API_KEY"),
     )
-    result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
+    result = llm.with_structured_output(Reflection).invoke(prompt)
 
     return {
-        "is_sufficient": result.is_sufficient,
+        "is_sufficient": bool(result.is_sufficient),
         "knowledge_gap": result.knowledge_gap,
-        "follow_up_queries": result.follow_up_queries,
-        "research_loop_count": state["research_loop_count"],
-        "number_of_ran_queries": len(state["search_query"]),
+        "pending_queries": result.follow_up_queries or [],
+        "research_loop_count": next_count,
+        "read_files_count": int(state.get("read_files_count", 0)),
+        "min_files": int(state.get("min_files", 1)),
+        "max_research_loops": int(state.get("max_research_loops", 10)),
     }
 
 
-def evaluate_research(
-    state: ReflectionState,
-    config: RunnableConfig,
-) -> OverallState:
-    """Decide whether to continue searching or finalize."""
-    configurable = Configuration.from_runnable_config(config)
-    max_research_loops = (
-        state.get("max_research_loops")
-        if state.get("max_research_loops") is not None
-        else configurable.max_research_loops
-    )
-
-    if state["is_sufficient"] or state["research_loop_count"] >= max_research_loops:
+def route_after_reflection(ref_out: dict) -> str:
+    if ref_out.get("research_loop_count", 0) >= ref_out.get("max_research_loops", 10):
         return "finalize_answer"
-
-    return [
-        Send(
-            "web_research",
-            {
-                "search_query": follow_up_query,
-                "id": state["number_of_ran_queries"] + int(idx),
-            },
-        )
-        for idx, follow_up_query in enumerate(state["follow_up_queries"])
-    ]
+    if ref_out.get("is_sufficient") and ref_out.get("read_files_count", 0) >= ref_out.get("min_files", 1):
+        return "finalize_answer"
+    return "read_next_file"
 
 
-def finalize_answer(state: OverallState, config: RunnableConfig):
-    """Finalize answer and replace short URLs with original URLs."""
+def finalize_answer(state: OverallState, config: RunnableConfig) -> dict:
+    # Final answer is synthesized strictly from local summaries and sources.
     configurable = Configuration.from_runnable_config(config)
     reasoning_model = state.get("reasoning_model") or configurable.answer_model
 
-    current_date = get_current_date()
-    formatted_prompt = answer_instructions.format(
-        current_date=current_date,
-        research_topic=get_research_topic(state["messages"]),
-        summaries="\n---\n\n".join(state["web_research_result"]),
+    question = get_research_topic(state["messages"])
+    summaries = "\n---\n\n".join(state.get("web_research_result", []))
+
+    prompt = answer_instructions.format(
+        current_date=get_current_date(),
+        question=question,
+        summaries=summaries,
     )
 
     llm = ChatGroq(
@@ -202,40 +193,31 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         max_retries=2,
         api_key=os.getenv("GROQ_API_KEY"),
     )
-    result = llm.invoke(formatted_prompt)
+    result = llm.invoke(prompt)
 
-    # Replace the short urls with the original urls and keep only used urls
-    unique_sources = []
     sources = state.get("sources_gathered", [])
-
+    unique_sources = []
+    content = result.content
     for source in sources:
         short = source.get("short_url")
-        if short and short in result.content:
-            result.content = result.content.replace(short, source["value"])
+        if short and short in content:
+            content = content.replace(short, source["value"])
             unique_sources.append(source)
 
-    return {
-        "messages": [AIMessage(content=result.content)],
-        "sources_gathered": unique_sources,
-    }
+    return {"messages": [AIMessage(content=content)], "sources_gathered": unique_sources}
 
 
-# Create our Agent Graph
 builder = StateGraph(OverallState, config_schema=Configuration)
 
-builder.add_node("generate_query", generate_query)
-builder.add_node("web_research", web_research)
+builder.add_node("scan_directory", scan_directory)
+builder.add_node("read_next_file", read_next_file)
 builder.add_node("reflection", reflection)
 builder.add_node("finalize_answer", finalize_answer)
 
-builder.add_edge(START, "generate_query")
-builder.add_conditional_edges(
-    "generate_query", continue_to_web_research, ["web_research"]
-)
-builder.add_edge("web_research", "reflection")
-builder.add_conditional_edges(
-    "reflection", evaluate_research, ["web_research", "finalize_answer"]
-)
+builder.add_edge(START, "scan_directory")
+builder.add_edge("scan_directory", "read_next_file")
+builder.add_edge("read_next_file", "reflection")
+builder.add_conditional_edges("reflection", route_after_reflection, ["read_next_file", "finalize_answer"])
 builder.add_edge("finalize_answer", END)
 
-graph = builder.compile(name="pro-search-agent")
+graph = builder.compile(name="universal-local-agent")
