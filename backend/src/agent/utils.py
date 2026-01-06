@@ -1,166 +1,230 @@
-from typing import Any, Dict, List
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Dict, List, Tuple
+
 from langchain_core.messages import AnyMessage, AIMessage, HumanMessage
 
 
+# File types supported by local search (targeted for markdown-based docs)
+ALLOWED_TEXT_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".rst",
+    ".log",
+    ".json",
+    ".yaml",
+    ".yml",
+}
+
+
 def get_research_topic(messages: List[AnyMessage]) -> str:
-    """
-    Get the research topic from the messages.
-    """
-    # check if request has a history and combine the messages into a single string
+    # Extract the research question from the conversation state.
     if len(messages) == 1:
-        research_topic = messages[-1].content
-    else:
-        research_topic = ""
-        for message in messages:
-            if isinstance(message, HumanMessage):
-                research_topic += f"User: {message.content}\n"
-            elif isinstance(message, AIMessage):
-                research_topic += f"Assistant: {message.content}\n"
+        return messages[-1].content
+
+    research_topic = ""
+    for message in messages:
+        if isinstance(message, HumanMessage):
+            research_topic += f"User: {message.content}\n"
+        elif isinstance(message, AIMessage):
+            research_topic += f"Assistant: {message.content}\n"
     return research_topic
 
 
-def resolve_urls(urls_to_resolve: List[Any], id: int) -> Dict[str, str]:
-    """
-    Create a map of the vertex ai search urls (very long) to a short url with a unique id for each url.
-    Ensures each original URL gets a consistent shortened form while maintaining uniqueness.
-    """
-    prefix = f"https://vertexaisearch.cloud.google.com/id/"
-    urls = [site.web.uri for site in urls_to_resolve]
-
-    # Create a dictionary that maps each unique URL to its first occurrence index
-    resolved_map = {}
-    for idx, url in enumerate(urls):
-        if url not in resolved_map:
-            resolved_map[url] = f"{prefix}{id}-{idx}"
-
-    return resolved_map
+def _tokenize(text: str) -> List[str]:
+    # Lightweight tokenizer used for cheap relevance scoring.
+    return re.findall(r"[a-zA-Z0-9_]+", (text or "").lower())
 
 
-def insert_citation_markers(text, citations_list):
-    """
-    Inserts citation markers into a text string based on start and end indices.
+def _read_text_file(path: Path) -> str:
+    # Best-effort text read for local files.
+    return path.read_text(encoding="utf-8", errors="ignore")
 
-    Args:
-        text (str): The original text string.
-        citations_list (list): A list of dictionaries, where each dictionary
-                               contains 'start_index', 'end_index', and
-                               'segment_string' (the marker to insert).
-                               Indices are assumed to be for the original text.
 
-    Returns:
-        str: The text with citation markers inserted.
-    """
-    # Sort citations by end_index in descending order.
-    # If end_index is the same, secondary sort by start_index descending.
-    # This ensures that insertions at the end of the string don't affect
-    # the indices of earlier parts of the string that still need to be processed.
-    sorted_citations = sorted(
-        citations_list, key=lambda c: (c["end_index"], c["start_index"]), reverse=True
-    )
+def list_text_files(directory: str) -> List[str]:
+    # Recursively collect all text-like files from the local directory.
+    root = Path(directory)
+    if not root.exists() or not root.is_dir():
+        return []
 
-    modified_text = text
-    for citation_info in sorted_citations:
-        # These indices refer to positions in the *original* text,
-        # but since we iterate from the end, they remain valid for insertion
-        # relative to the parts of the string already processed.
-        end_idx = citation_info["end_index"]
-        marker_to_insert = ""
-        for segment in citation_info["segments"]:
-            marker_to_insert += f" [{segment['label']}]({segment['short_url']})"
-        # Insert the citation marker at the original end_idx position
-        modified_text = (
-            modified_text[:end_idx] + marker_to_insert + modified_text[end_idx:]
+    files: List[str] = []
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+
+        if p.suffix.lower() in ALLOWED_TEXT_EXTENSIONS or p.name in {"LICENSE", "COPYING", "README"}:
+            files.append(str(p))
+    return files
+
+
+def extract_markdown_headings(text: str, max_lines: int = 120) -> str:
+    # Extract early markdown headings for fast structural profiling.
+    lines = (text or "").splitlines()
+    out: List[str] = []
+    for line in lines[:max_lines]:
+        s = line.strip()
+        if s.startswith("#"):
+            out.append(s)
+    return "\n".join(out).strip()
+
+
+def build_file_profile(file_path: str, profile_chars: int) -> str:
+    # Cheap scan phase:
+    # build a lightweight profile (headings + preview) without full-text processing.
+    path = Path(file_path)
+    try:
+        text = _read_text_file(path)
+    except Exception:
+        return ""
+
+    preview = text[: max(0, profile_chars)]
+    if path.suffix.lower() == ".md":
+        heads = extract_markdown_headings(text)
+        if heads:
+            return f"HEADINGS:\n{heads}\n\nPREVIEW:\n{preview}".strip()
+    return f"PREVIEW:\n{preview}".strip()
+
+
+def score_profile(question: str, pending_queries: List[str], file_path: str, profile: str) -> int:
+    # Cheap relevance scoring used during local scan and re-ranking.
+    # Combines filename match, token overlap, and literal phrase bonus.
+    base_text = (question or "").strip()
+    for q in pending_queries or []:
+        base_text += " " + (q or "")
+
+    tokens = set(_tokenize(base_text))
+    if not tokens:
+        return 0
+
+    name = Path(file_path).name.lower()
+    score = 0
+    for t in tokens:
+        if t in name:
+            score += 5
+
+    prof_tokens = set(_tokenize(profile))
+    score += len(tokens & prof_tokens)
+
+    if question and question.lower() in (profile or "").lower():
+        score += 10
+
+    return score
+
+
+def chunk_text(text: str, chunk_size: int, overlap: int) -> List[Tuple[int, int, str]]:
+    # Split text into overlapping chunks for deep local reading.
+    if chunk_size <= 0:
+        return [(0, len(text), text)]
+
+    overlap = max(0, min(overlap, chunk_size - 1))
+    chunks: List[Tuple[int, int, str]] = []
+
+    i = 0
+    n = len(text)
+    while i < n:
+        end = min(n, i + chunk_size)
+        chunks.append((i, end, text[i:end]))
+        if end == n:
+            break
+        i = end - overlap
+
+    return chunks
+
+
+def top_k_chunks(
+    question: str,
+    pending_queries: List[str],
+    chunks: List[Tuple[int, int, str]],
+    k: int,
+) -> List[Tuple[int, int, str]]:
+    # Select the most relevant chunks based on token overlap.
+    base_text = (question or "").strip()
+    for q in pending_queries or []:
+        base_text += " " + (q or "")
+
+    q_tokens = set(_tokenize(base_text))
+    if not q_tokens or not chunks:
+        return []
+
+    scored: List[Tuple[int, Tuple[int, int, str]]] = []
+    for ch in chunks:
+        _, _, txt = ch
+        tset = set(_tokenize(txt))
+        sc = len(q_tokens & tset)
+        if sc > 0:
+            scored.append((sc, ch))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [ch for _, ch in scored[: max(1, k)]]
+
+
+def pick_excerpts_for_file(
+    file_path: str,
+    question: str,
+    pending_queries: List[str],
+    *,
+    chunk_size: int,
+    chunk_overlap: int,
+    top_chunks: int,
+) -> List[str]:
+    # Deep local read strategy:
+    # 1) prefer top-k relevant chunks
+    # 2) fallback to headings + early chunks to avoid missing content
+    path = Path(file_path)
+    try:
+        text = _read_text_file(path)
+    except Exception:
+        return []
+
+    chunks = chunk_text(text, chunk_size, chunk_overlap)
+    selected = top_k_chunks(question, pending_queries, chunks, top_chunks)
+
+    if selected:
+        return [txt for _, _, txt in selected]
+
+    excerpts: List[str] = []
+    if path.suffix.lower() == ".md":
+        heads = extract_markdown_headings(text)
+        if heads:
+            excerpts.append("HEADINGS:\n" + heads)
+
+    if chunks:
+        excerpts.append(chunks[0][2])
+        if len(chunks) > 1:
+            excerpts.append(chunks[1][2])
+
+    return excerpts[: max(1, min(2, top_chunks))]
+
+
+def sources_from_excerpts(file_path: str, file_id: int, excerpts: List[str]) -> List[Dict[str, str]]:
+    # Convert local excerpts into citation objects compatible with the agent prompts.
+    out: List[Dict[str, str]] = []
+    for idx, snippet in enumerate(excerpts):
+        out.append(
+            {
+                "label": Path(file_path).name,
+                "short_url": f"local://{file_id}-{idx}",
+                "value": file_path,
+                "title": f"{Path(file_path).name} (excerpt {idx + 1})",
+                "snippet": (snippet or "").strip(),
+            }
         )
+    return out
 
-    return modified_text
 
+def format_search_results_for_prompt(short_sources: List[Dict[str, str]]) -> str:
+    # Format local excerpts into a prompt-ready citation block.
+    lines: List[str] = []
+    for i, s in enumerate(short_sources, start=1):
+        title = s.get("title", "").strip()
+        snippet = s.get("snippet", "").strip()
+        short_url = s.get("short_url", "").strip()
 
-def get_citations(response, resolved_urls_map):
-    """
-    Extracts and formats citation information from a Gemini model's response.
-
-    This function processes the grounding metadata provided in the response to
-    construct a list of citation objects. Each citation object includes the
-    start and end indices of the text segment it refers to, and a string
-    containing formatted markdown links to the supporting web chunks.
-
-    Args:
-        response: The response object from the Gemini model, expected to have
-                  a structure including `candidates[0].grounding_metadata`.
-                  It also relies on a `resolved_map` being available in its
-                  scope to map chunk URIs to resolved URLs.
-
-    Returns:
-        list: A list of dictionaries, where each dictionary represents a citation
-              and has the following keys:
-              - "start_index" (int): The starting character index of the cited
-                                     segment in the original text. Defaults to 0
-                                     if not specified.
-              - "end_index" (int): The character index immediately after the
-                                   end of the cited segment (exclusive).
-              - "segments" (list[str]): A list of individual markdown-formatted
-                                        links for each grounding chunk.
-              - "segment_string" (str): A concatenated string of all markdown-
-                                        formatted links for the citation.
-              Returns an empty list if no valid candidates or grounding supports
-              are found, or if essential data is missing.
-    """
-    citations = []
-
-    # Ensure response and necessary nested structures are present
-    if not response or not response.candidates:
-        return citations
-
-    candidate = response.candidates[0]
-    if (
-        not hasattr(candidate, "grounding_metadata")
-        or not candidate.grounding_metadata
-        or not hasattr(candidate.grounding_metadata, "grounding_supports")
-    ):
-        return citations
-
-    for support in candidate.grounding_metadata.grounding_supports:
-        citation = {}
-
-        # Ensure segment information is present
-        if not hasattr(support, "segment") or support.segment is None:
-            continue  # Skip this support if segment info is missing
-
-        start_index = (
-            support.segment.start_index
-            if support.segment.start_index is not None
-            else 0
-        )
-
-        # Ensure end_index is present to form a valid segment
-        if support.segment.end_index is None:
-            continue  # Skip if end_index is missing, as it's crucial
-
-        # Add 1 to end_index to make it an exclusive end for slicing/range purposes
-        # (assuming the API provides an inclusive end_index)
-        citation["start_index"] = start_index
-        citation["end_index"] = support.segment.end_index
-
-        citation["segments"] = []
-        if (
-            hasattr(support, "grounding_chunk_indices")
-            and support.grounding_chunk_indices
-        ):
-            for ind in support.grounding_chunk_indices:
-                try:
-                    chunk = candidate.grounding_metadata.grounding_chunks[ind]
-                    resolved_url = resolved_urls_map.get(chunk.web.uri, None)
-                    citation["segments"].append(
-                        {
-                            "label": chunk.web.title.split(".")[:-1][0],
-                            "short_url": resolved_url,
-                            "value": chunk.web.uri,
-                        }
-                    )
-                except (IndexError, AttributeError, NameError):
-                    # Handle cases where chunk, web, uri, or resolved_map might be problematic
-                    # For simplicity, we'll just skip adding this particular segment link
-                    # In a production system, you might want to log this.
-                    pass
-        citations.append(citation)
-    return citations
+        lines.append(f"S{i}: {title}")
+        if snippet:
+            lines.append(f"Snippet: {snippet}")
+        lines.append(f"Use this citation exactly: [S{i}]({short_url})")
+        lines.append("")
+    return "\n".join(lines).strip()
